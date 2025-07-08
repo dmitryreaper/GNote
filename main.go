@@ -9,11 +9,11 @@ import (
 	"fyne.io/fyne/v2/app"
 
 	"GNote/storage"
-	"GNote/ui"
+	"GNote/ui" 
 )
 
 func main() {
-	// Загрузка конфигурации БД из переменных окружения
+
 	dbHost := os.Getenv("DB_HOST")
 	if dbHost == "" {
 		dbHost = "localhost"
@@ -21,23 +21,23 @@ func main() {
 	dbPortStr := os.Getenv("DB_PORT")
 	dbPort, err := strconv.Atoi(dbPortStr)
 	if err != nil {
-		dbPort = 5432 
-}
+		dbPort = 5432
+	}
 	dbUser := os.Getenv("DB_USER")
 	if dbUser == "" {
-		dbUser = "dima" 
+		dbUser = "dima"
 	}
 	dbPassword := os.Getenv("DB_PASSWORD")
 	if dbPassword == "" {
-		dbPassword = "" 
+		dbPassword = ""
 	}
 	dbName := os.Getenv("DB_NAME")
 	if dbName == "" {
-		dbName = "notes_db"
+		dbName = "gnote_db"
 	}
 	dbSSLMode := os.Getenv("DB_SSLMODE")
 	if dbSSLMode == "" {
-		dbSSLMode = "disable" // 'disable' для локальной разработки
+		dbSSLMode = "disable" 
 	}
 
 	dbConfig := storage.Config{
@@ -58,10 +58,11 @@ func main() {
 	// Инициализация Fyne приложения
 	a := app.New()
 	w := a.NewWindow("Приложение для заметок")
-	w.SetIcon(fyne.NewStaticResource("note.ico", []byte{})) 
+	w.SetIcon(fyne.NewStaticResource("note.png", []byte{})) 
 
 	// Создание и запуск UI приложения
 	noteApp := ui.NewNoteApp(w, store)
 	_ = noteApp 
+
 	w.ShowAndRun()
 }

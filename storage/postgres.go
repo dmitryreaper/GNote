@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	_ "github.com/lib/pq"
+	pq "github.com/lib/pq" 
 	"GNote/models" 
 )
 
@@ -53,33 +53,99 @@ func NewPostgresStore(cfg Config) (*PostgresStore, error) {
 	return &PostgresStore{db: db}, nil
 }
 
-// CreateNote создает новую заметку в БД
+// CreateNote создает новую заметку в БД, включая теги и напоминания
 func (s *PostgresStore) CreateNote(note *models.Note) error {
-	query := `INSERT INTO notes (title, content) VALUES ($1, $2) RETURNING id, created_at, updated_at`
-	err := s.db.QueryRow(query, note.Title, note.Content).Scan(&note.ID, &note.CreatedAt, &note.UpdatedAt)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("не удалось начать транзакцию: %w", err)
+	}
+	defer tx.Rollback() // Откат в случае ошибки
+
+	// Вставляем заметку
+	query := `INSERT INTO notes (title, content, reminder_at) VALUES ($1, $2, $3) RETURNING id, created_at, updated_at`
+	var reminderAtSQL sql.NullTime
+	if note.ReminderAt != nil {
+		reminderAtSQL = sql.NullTime{Time: *note.ReminderAt, Valid: true}
+	}
+	err = tx.QueryRow(query, note.Title, note.Content, reminderAtSQL).Scan(&note.ID, &note.CreatedAt, &note.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("ошибка при создании заметки: %w", err)
 	}
-	return nil
+
+	// Обрабатываем теги
+	if len(note.Tags) > 0 {
+		for _, tagName := range note.Tags {
+			var tagID int
+			// Ищем существующий тег или создаем новый
+			err := tx.QueryRow(`INSERT INTO tags (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name RETURNING id`, tagName).Scan(&tagID)
+			if err != nil {
+				return fmt.Errorf("ошибка при создании/получении тега: %w", err)
+			}
+			// Привязываем тег к заметке
+			_, err = tx.Exec(`INSERT INTO note_tags (note_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, note.ID, tagID)
+			if err != nil {
+				return fmt.Errorf("ошибка при привязке тега к заметке: %w", err)
+			}
+		}
+	}
+
+	return tx.Commit() // Подтверждаем транзакцию
 }
 
-// GetNoteByID получает заметку по ID
+// GetNoteByID получает заметку по ID, включая теги
 func (s *PostgresStore) GetNoteByID(id int) (*models.Note, error) {
 	var note models.Note
-	query := `SELECT id, title, content, created_at, updated_at FROM notes WHERE id = $1`
-	err := s.db.QueryRow(query, id).Scan(&note.ID, &note.Title, &note.Content, &note.CreatedAt, &note.UpdatedAt)
+	var reminderAtSQL sql.NullTime
+
+	query := `SELECT id, title, content, created_at, updated_at, reminder_at FROM notes WHERE id = $1`
+	err := s.db.QueryRow(query, id).Scan(&note.ID, &note.Title, &note.Content, &note.CreatedAt, &note.UpdatedAt, &reminderAtSQL)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("заметка с ID %d не найдена", id)
 		}
 		return nil, fmt.Errorf("ошибка при получении заметки по ID: %w", err)
 	}
+
+	if reminderAtSQL.Valid {
+		note.ReminderAt = &reminderAtSQL.Time
+	}
+
+	// Получаем теги для заметки
+	rows, err := s.db.Query(`SELECT t.name FROM tags t JOIN note_tags nt ON t.id = nt.tag_id WHERE nt.note_id = $1`, note.ID)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка при получении тегов заметки: %w", err)
+	}
+	defer rows.Close()
+
+	var tags []string
+	for rows.Next() {
+		var tagName string
+		if err := rows.Scan(&tagName); err != nil {
+			return nil, fmt.Errorf("ошибка при сканировании тега: %w", err)
+		}
+		tags = append(tags, tagName)
+	}
+	note.Tags = tags
+
 	return &note, nil
 }
 
-// GetAllNotes получает все заметки
+// GetAllNotes получает все заметки, включая теги
 func (s *PostgresStore) GetAllNotes() ([]models.Note, error) {
-	rows, err := s.db.Query(`SELECT id, title, content, created_at, updated_at FROM notes ORDER BY created_at DESC`)
+	// Используем LEFT JOIN для получения всех заметок и их тегов
+	// ARRAY_AGG в Postgres для объединения тегов в одну строку
+	// COALESCE(ARRAY_AGG(...), '{}') для обработки заметок без тегов (возвращает пустой массив вместо NULL)
+	query := `
+		SELECT
+			n.id, n.title, n.content, n.created_at, n.updated_at, n.reminder_at,
+			COALESCE(ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL), '{}') AS tags
+		FROM notes n
+		LEFT JOIN note_tags nt ON n.id = nt.note_id
+		LEFT JOIN tags t ON nt.tag_id = t.id
+		GROUP BY n.id, n.title, n.content, n.created_at, n.updated_at, n.reminder_at
+		ORDER BY n.created_at DESC`
+
+	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка при получении всех заметок: %w", err)
 	}
@@ -88,9 +154,20 @@ func (s *PostgresStore) GetAllNotes() ([]models.Note, error) {
 	var notes []models.Note
 	for rows.Next() {
 		var note models.Note
-		if err := rows.Scan(&note.ID, &note.Title, &note.Content, &note.CreatedAt, &note.UpdatedAt); err != nil {
+		var tagsArray []string // Изменено: теперь сканируем прямо в []string
+		var reminderAtSQL sql.NullTime
+
+		// Изменено: используем pq.Array для сканирования массива тегов
+		if err := rows.Scan(&note.ID, &note.Title, &note.Content, &note.CreatedAt, &note.UpdatedAt, &reminderAtSQL, pq.Array(&tagsArray)); err != nil {
 			return nil, fmt.Errorf("ошибка при сканировании заметки: %w", err)
 		}
+
+		if reminderAtSQL.Valid {
+			note.ReminderAt = &reminderAtSQL.Time
+		}
+
+		// Теперь tagsArray уже содержит []string, не нужно дополнительно преобразовывать
+		note.Tags = tagsArray
 		notes = append(notes, note)
 	}
 
@@ -101,25 +178,75 @@ func (s *PostgresStore) GetAllNotes() ([]models.Note, error) {
 	return notes, nil
 }
 
-// UpdateNote обновляет существующую заметку
+// UpdateNote обновляет существующую заметку, включая теги и напоминания
 func (s *PostgresStore) UpdateNote(note *models.Note) error {
-	query := `UPDATE notes SET title = $1, content = $2, updated_at = $3 WHERE id = $4 RETURNING updated_at`
-	// Принудительно обновляем updated_at, хотя триггер в БД тоже это сделает.
-	// Это для того, чтобы получить актуальное значение сразу после запроса.
-	note.UpdatedAt = time.Now()
-	err := s.db.QueryRow(query, note.Title, note.Content, note.UpdatedAt, note.ID).Scan(&note.UpdatedAt)
+	tx, err := s.db.Begin()
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("заметка с ID %d не найдена для обновления", note.ID)
-		}
-		// return nil, fmt.Errorf("ошибка при обновлении заметки: %w", err)
+		return fmt.Errorf("не удалось начать транзакцию: %w", err)
 	}
-	return nil
+	defer tx.Rollback()
+
+	// Устанавливаем updated_at в Go, чтобы явно использовать пакет time
+	note.UpdatedAt = time.Now()
+
+	// Обновляем заметку
+	query := `UPDATE notes SET title = $1, content = $2, reminder_at = $3, updated_at = $4 WHERE id = $5`
+	var reminderAtSQL sql.NullTime
+	if note.ReminderAt != nil {
+		reminderAtSQL = sql.NullTime{Time: *note.ReminderAt, Valid: true}
+	}
+	res, err := tx.Exec(query, note.Title, note.Content, reminderAtSQL, note.UpdatedAt, note.ID)
+	if err != nil {
+		return fmt.Errorf("ошибка при обновлении заметки: %w", err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("ошибка при получении количества затронутых строк: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("заметка с ID %d не найдена для обновления", note.ID)
+	}
+
+	// Удаляем старые привязки тегов для этой заметки
+	_, err = tx.Exec(`DELETE FROM note_tags WHERE note_id = $1`, note.ID)
+	if err != nil {
+		return fmt.Errorf("ошибка при удалении старых тегов: %w", err)
+	}
+
+	// Добавляем новые привязки тегов
+	if len(note.Tags) > 0 {
+		for _, tagName := range note.Tags {
+			var tagID int
+			err := tx.QueryRow(`INSERT INTO tags (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name RETURNING id`, tagName).Scan(&tagID)
+			if err != nil {
+				return fmt.Errorf("ошибка при создании/получении тега: %w", err)
+			}
+			_, err = tx.Exec(`INSERT INTO note_tags (note_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, note.ID, tagID)
+			if err != nil {
+				return fmt.Errorf("ошибка при привязке тега к заметке: %w", err)
+			}
+		}
+	}
+
+	return tx.Commit()
 }
 
 // DeleteNote удаляет заметку по ID
 func (s *PostgresStore) DeleteNote(id int) error {
-	res, err := s.db.Exec(`DELETE FROM notes WHERE id = $1`, id)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("не удалось начать транзакцию: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Удаляем привязки тегов (CASCADE в БД позаботится об этом, но можно явно)
+	_, err = tx.Exec(`DELETE FROM note_tags WHERE note_id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("ошибка при удалении привязок тегов: %w", err)
+	}
+
+	// Удаляем заметку
+	res, err := tx.Exec(`DELETE FROM notes WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("ошибка при удалении заметки: %w", err)
 	}
@@ -132,5 +259,6 @@ func (s *PostgresStore) DeleteNote(id int) error {
 	if rowsAffected == 0 {
 		return fmt.Errorf("заметка с ID %d не найдена для удаления", id)
 	}
-	return nil
+
+	return tx.Commit()
 }
