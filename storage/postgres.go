@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"log"
 	"time"
+	"os"
 
-	pq "github.com/lib/pq" 
+	"github.com/lib/pq" 
 	"GNote/models" 
 )
 
@@ -27,6 +28,9 @@ type Store interface {
 	GetAllNotes() ([]models.Note, error)
 	UpdateNote(note *models.Note) error
 	DeleteNote(id int) error
+	CreateAttachment(attachment *models.Attachment) error
+	GetAttachmentsByNoteID(noteID int) ([]models.Attachment, error)
+	DeleteAttachment(attachmentID int) error
 }
 
 // PostgresStore реализует Store для PostgreSQL
@@ -92,7 +96,7 @@ func (s *PostgresStore) CreateNote(note *models.Note) error {
 	return tx.Commit() // Подтверждаем транзакцию
 }
 
-// GetNoteByID получает заметку по ID, включая теги
+// GetNoteByID получает заметку по ID, включая теги и вложения
 func (s *PostgresStore) GetNoteByID(id int) (*models.Note, error) {
 	var note models.Note
 	var reminderAtSQL sql.NullTime
@@ -127,14 +131,18 @@ func (s *PostgresStore) GetNoteByID(id int) (*models.Note, error) {
 	}
 	note.Tags = tags
 
+	// Получаем вложения для заметки
+	attachments, err := s.GetAttachmentsByNoteID(note.ID)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка при получении вложений заметки: %w", err)
+	}
+	note.Attachments = attachments
+
 	return &note, nil
 }
 
-// GetAllNotes получает все заметки, включая теги
+// GetAllNotes получает все заметки, включая теги (вложения не загружаем для списка, чтобы не перегружать)
 func (s *PostgresStore) GetAllNotes() ([]models.Note, error) {
-	// Используем LEFT JOIN для получения всех заметок и их тегов
-	// ARRAY_AGG в Postgres для объединения тегов в одну строку
-	// COALESCE(ARRAY_AGG(...), '{}') для обработки заметок без тегов (возвращает пустой массив вместо NULL)
 	query := `
 		SELECT
 			n.id, n.title, n.content, n.created_at, n.updated_at, n.reminder_at,
@@ -154,11 +162,10 @@ func (s *PostgresStore) GetAllNotes() ([]models.Note, error) {
 	var notes []models.Note
 	for rows.Next() {
 		var note models.Note
-		var tagsArray []string // Изменено: теперь сканируем прямо в []string
+		var tagsArray pq.StringArray // <--- ИЗМЕНЕНИЕ ЗДЕСЬ: используем pq.StringArray
 		var reminderAtSQL sql.NullTime
 
-		// Изменено: используем pq.Array для сканирования массива тегов
-		if err := rows.Scan(&note.ID, &note.Title, &note.Content, &note.CreatedAt, &note.UpdatedAt, &reminderAtSQL, pq.Array(&tagsArray)); err != nil {
+		if err := rows.Scan(&note.ID, &note.Title, &note.Content, &note.CreatedAt, &note.UpdatedAt, &reminderAtSQL, &tagsArray); err != nil {
 			return nil, fmt.Errorf("ошибка при сканировании заметки: %w", err)
 		}
 
@@ -166,8 +173,10 @@ func (s *PostgresStore) GetAllNotes() ([]models.Note, error) {
 			note.ReminderAt = &reminderAtSQL.Time
 		}
 
-		// Теперь tagsArray уже содержит []string, не нужно дополнительно преобразовывать
-		note.Tags = tagsArray
+		// Преобразуем pq.StringArray в []string
+		note.Tags = []string(tagsArray) // <--- ИЗМЕНЕНИЕ ЗДЕСЬ: прямое преобразование
+		// Вложения не загружаем здесь, только при выборе конкретной заметки
+		note.Attachments = []models.Attachment{}
 		notes = append(notes, note)
 	}
 
@@ -239,11 +248,21 @@ func (s *PostgresStore) DeleteNote(id int) error {
 	}
 	defer tx.Rollback()
 
+	// Сначала получаем пути к файлам вложений, чтобы удалить их с диска
+	attachments, err := s.GetAttachmentsByNoteID(id)
+	if err != nil {
+		// Логируем ошибку, но продолжаем удаление заметки, чтобы не блокировать
+		log.Printf("Предупреждение: не удалось получить вложения для заметки ID %d при удалении: %v", id, err)
+	}
+
 	// Удаляем привязки тегов (CASCADE в БД позаботится об этом, но можно явно)
 	_, err = tx.Exec(`DELETE FROM note_tags WHERE note_id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("ошибка при удалении привязок тегов: %w", err)
 	}
+
+	// Удаляем вложения из таблицы attachments (благодаря ON DELETE CASCADE это сделает сама БД)
+	// Но если бы не было CASCADE, здесь был бы DELETE FROM attachments WHERE note_id = $1
 
 	// Удаляем заметку
 	res, err := tx.Exec(`DELETE FROM notes WHERE id = $1`, id)
@@ -260,5 +279,85 @@ func (s *PostgresStore) DeleteNote(id int) error {
 		return fmt.Errorf("заметка с ID %d не найдена для удаления", id)
 	}
 
+	// Если заметка успешно удалена из БД, удаляем физические файлы вложений
+	for _, attach := range attachments {
+		if err := os.Remove(attach.Filepath); err != nil {
+			log.Printf("Ошибка при удалении файла вложения '%s': %v", attach.Filepath, err)
+		} else {
+			log.Printf("Файл вложения '%s' успешно удален с диска.", attach.Filepath)
+		}
+	}
+
 	return tx.Commit()
+}
+
+// CreateAttachment создает запись о вложении в БД
+func (s *PostgresStore) CreateAttachment(attachment *models.Attachment) error {
+	query := `INSERT INTO attachments (note_id, filename, filepath, mimetype, size_bytes) VALUES ($1, $2, $3, $4, $5) RETURNING id, uploaded_at`
+	err := s.db.QueryRow(query, attachment.NoteID, attachment.Filename, attachment.Filepath, attachment.MimeType, attachment.SizeBytes).Scan(&attachment.ID, &attachment.UploadedAt)
+	if err != nil {
+		return fmt.Errorf("ошибка при создании вложения: %w", err)
+	}
+	return nil
+}
+
+// GetAttachmentsByNoteID получает все вложения для указанной заметки
+func (s *PostgresStore) GetAttachmentsByNoteID(noteID int) ([]models.Attachment, error) {
+	query := `SELECT id, note_id, filename, filepath, mimetype, size_bytes, uploaded_at FROM attachments WHERE note_id = $1 ORDER BY uploaded_at ASC`
+	rows, err := s.db.Query(query, noteID)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка при получении вложений для заметки %d: %w", noteID, err)
+	}
+	defer rows.Close()
+
+	var attachments []models.Attachment
+	for rows.Next() {
+		var attach models.Attachment
+		if err := rows.Scan(&attach.ID, &attach.NoteID, &attach.Filename, &attach.Filepath, &attach.MimeType, &attach.SizeBytes, &attach.UploadedAt); err != nil {
+			return nil, fmt.Errorf("ошибка при сканировании вложения: %w", err)
+		}
+		attachments = append(attachments, attach)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("ошибка после итерации по строкам вложений: %w", err)
+	}
+	return attachments, nil
+}
+
+// DeleteAttachment удаляет запись о вложении из БД и сам файл с диска
+func (s *PostgresStore) DeleteAttachment(attachmentID int) error {
+	// Сначала получаем путь к файлу
+	var filepath string
+	query := `SELECT filepath FROM attachments WHERE id = $1`
+	err := s.db.QueryRow(query, attachmentID).Scan(&filepath)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("вложение с ID %d не найдено", attachmentID)
+		}
+		return fmt.Errorf("ошибка при получении пути к файлу вложения: %w", err)
+	}
+
+	// Удаляем запись из БД
+	res, err := s.db.Exec(`DELETE FROM attachments WHERE id = $1`, attachmentID)
+	if err != nil {
+		return fmt.Errorf("ошибка при удалении вложения из БД: %w", err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("ошибка при проверке затронутых строк после удаления вложения: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("вложение с ID %d не найдено для удаления в БД", attachmentID)
+	}
+
+	// Удаляем физический файл
+	if err := os.Remove(filepath); err != nil {
+		// Логируем ошибку, но не возвращаем ее, так как запись из БД уже удалена
+		log.Printf("Ошибка при удалении физического файла вложения '%s': %v", filepath, err)
+	} else {
+		log.Printf("Физический файл вложения '%s' успешно удален.", filepath)
+	}
+
+	return nil
 }
