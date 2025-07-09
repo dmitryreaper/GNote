@@ -9,6 +9,10 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"os"     
+	"path/filepath"
+	"mime"
+	"os/exec"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -39,9 +43,9 @@ type NoteApp struct {
 	titleEntry     *widget.Entry
 	contentEntry   *widget.Entry
 	charCountLabel *widget.Label
-	tagsEntry      *widget.Entry // Для ввода тегов
-	reminderButton *widget.Button // Для установки напоминания
-	reminderLabel  *widget.Label  // Для отображения напоминания
+	tagsEntry      *widget.Entry 
+	reminderButton *widget.Button 
+	reminderLabel  *widget.Label  
 	saveButton     *widget.Button
 	deleteButton   *widget.Button
 
@@ -49,6 +53,12 @@ type NoteApp struct {
 	reminderDateEntry *widget.Entry
 	reminderTimeEntry *widget.Entry
 	currentReminder   *time.Time // Временное хранилище для даты/времени напоминания в диалоге
+
+	// НОВЫЕ ЭЛЕМЕНТЫ ДЛЯ ВЛОЖЕНИЙ
+	attachmentsContainer *fyne.Container // Контейнер для списка вложений и кнопки "Прикрепить"
+	attachmentsList      *widget.List    // Список отображаемых вложений
+	attachButton         *widget.Button  // Кнопка для прикрепления файла
+	attachmentsDirPath   string          // Путь к директории для хранения вложений
 }
 
 // NewNoteApp создает новый экземпляр NoteApp
@@ -56,13 +66,25 @@ func NewNoteApp(w fyne.Window, s storage.Store) *NoteApp {
 	app := &NoteApp{
 		window:            w,
 		store:             s,
-		selectedNoteIndex: -1, // Изначально ничего не выбрано
+		selectedNoteIndex: -1, 
 		hasUnsavedChanges: false,
 	}
 	app.window.SetContent(app.MakeUI())
 	app.window.SetMaster() // Устанавливаем окно как основное
 	app.window.Resize(fyne.NewSize(1000, 700)) // Устанавливаем начальный размер
 	app.window.SetOnClosed(app.onWindowClosed) // Обработчик закрытия окна
+
+	// Определяем путь для хранения вложений
+	// Используем Storage().RootURI().Path() для кроссплатформенного пути к данным приложения
+	appDataPath := fyne.CurrentApp().Storage().RootURI().Path()
+	app.attachmentsDirPath = filepath.Join(appDataPath, "attachments")
+	// Создаем директорию, если она не существует
+	if err := os.MkdirAll(app.attachmentsDirPath, 0755); err != nil {
+		log.Printf("Ошибка при создании директории для вложений '%s': %v", app.attachmentsDirPath, err)
+		dialog.ShowError(fmt.Errorf("не удалось создать директорию для вложений: %w", err), app.window)
+	} else {
+		log.Printf("Директория для вложений: %s", app.attachmentsDirPath)
+	}
 
 	// Загружаем заметки при старте
 	app.loadNotes()
@@ -166,12 +188,66 @@ func (a *NoteApp) MakeUI() fyne.CanvasObject {
 	}
 
 	a.reminderLabel = widget.NewLabel("Напоминание: Не установлено")
-	a.reminderButton = widget.NewButton("Установить напоминание", a.setReminderDialog) // Изменено
+	a.reminderButton = widget.NewButton("Установить напоминание", a.setReminderDialog)
 	clearReminderButton := widget.NewButton("Очистить", func() {
 		a.setUnsavedChanges(true)
 		a.updateReminderUI(nil)
 	})
 	reminderContainer := container.NewHBox(a.reminderLabel, a.reminderButton, clearReminderButton)
+
+	// НОВЫЙ БЛОК: Вложения
+	a.attachButton = widget.NewButtonWithIcon("Прикрепить файл", theme.ContentAddIcon(), a.attachFile)
+	a.attachButton.Disable() // Изначально отключена, пока не выбрана заметка
+
+	a.attachmentsList = widget.NewList(
+		func() int {
+			selectedNote := a.getSelectedNote()
+			if selectedNote == nil {
+				return 0
+			}
+			return len(selectedNote.Attachments)
+		},
+		func() fyne.CanvasObject {
+			// Кастомный элемент списка для вложений
+			filenameLabel := widget.NewLabel("Имя файла")
+			sizeLabel := widget.NewLabel("Размер")
+			openButton := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), nil)
+			deleteButton := widget.NewButtonWithIcon("", theme.DeleteIcon(), nil)
+			return container.NewHBox(filenameLabel, layout.NewSpacer(), sizeLabel, openButton, deleteButton)
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			selectedNote := a.getSelectedNote()
+			if selectedNote == nil || i >= len(selectedNote.Attachments) {
+				return
+			}
+			attachment := selectedNote.Attachments[i]
+
+			hbox := o.(*fyne.Container)
+			filenameLabel := hbox.Objects[0].(*widget.Label)
+			sizeLabel := hbox.Objects[2].(*widget.Label)
+			openButton := hbox.Objects[3].(*widget.Button)
+			deleteButton := hbox.Objects[4].(*widget.Button)
+
+			filenameLabel.SetText(attachment.Filename)
+			sizeLabel.SetText(formatBytes(attachment.SizeBytes))
+
+			// Обработчики кнопок для каждого элемента списка
+			openButton.OnTapped = func() {
+				a.openAttachment(attachment)
+			}
+			deleteButton.OnTapped = func() {
+				a.deleteAttachment(attachment)
+			}
+		},
+	)
+	a.attachmentsContainer = container.NewBorder(
+		container.NewHBox(widget.NewLabel("Вложения:"), layout.NewSpacer(), a.attachButton),
+		nil,
+		nil,
+		nil,
+		container.NewScroll(a.attachmentsList),
+	)
+	// КОНЕЦ НОВОГО БЛОКА ВЛОЖЕНИЙ
 
 	a.saveButton = widget.NewButtonWithIcon("Сохранить", theme.DocumentSaveIcon(), a.saveNote)
 	a.saveButton.Disable()
@@ -197,7 +273,9 @@ func (a *NoteApp) MakeUI() fyne.CanvasObject {
 			a.tagsEntry,
 			reminderContainer,
 			widget.NewSeparator(),
-		), // Заголовок, теги, напоминание сверху
+			a.attachmentsContainer, // <-- ДОБАВЛЕНО: Контейнер для вложений
+			widget.NewSeparator(),
+		), // Заголовок, теги, напоминание, вложения сверху
 		container.NewVBox(
 			a.charCountLabel,
 			actionButtons,
@@ -331,8 +409,18 @@ func (a *NoteApp) doSelectNote(id widget.ListItemID) {
 		return // Некорректный ID
 	}
 
+	// Загружаем заметку с вложениями из БД
+	selectedNoteFromDB, err := a.store.GetNoteByID(a.filteredNotes[id].ID)
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("не удалось загрузить детали заметки: %w", err), a.window)
+		log.Printf("Ошибка при загрузке деталей заметки: %v", err)
+		return
+	}
+
+	// Обновляем заметку в filteredNotes, чтобы она содержала вложения
+	a.filteredNotes[id] = *selectedNoteFromDB
 	a.selectedNoteIndex = id
-	selectedNote := a.filteredNotes[id]
+	selectedNote := a.filteredNotes[id] // Используем обновленную заметку
 
 	a.titleEntry.SetText(selectedNote.Title)
 	a.contentEntry.SetText(selectedNote.Content)
@@ -341,7 +429,9 @@ func (a *NoteApp) doSelectNote(id widget.ListItemID) {
 
 	a.setUnsavedChanges(false) // Сброс флага после загрузки
 	a.deleteButton.Enable()
-	a.updateCharCount() // Обновить счетчик для выбранной заметки
+	a.attachButton.Enable() // Включаем кнопку "Прикрепить файл"
+	a.updateCharCount()     // Обновить счетчик для выбранной заметки
+	a.attachmentsList.Refresh() // Обновляем список вложений
 	log.Printf("Выбрана заметка: %s (ID: %d)", selectedNote.Title, selectedNote.ID)
 
 	// Обновляем визуальное выделение
@@ -368,8 +458,13 @@ func (a *NoteApp) doNewNote() {
 	a.updateReminderUI(nil) // Сброс напоминания
 	a.setUnsavedChanges(false)
 	a.deleteButton.Disable()
+	a.attachButton.Disable() // Отключаем кнопку "Прикрепить файл" для новой заметки (пока не сохранена)
 	a.noteList.UnselectAll() // Снимаем выделение со списка
-	a.updateCharCount() // Обновить счетчик для пустой заметки
+	a.updateCharCount()      // Обновить счетчик для пустой заметки
+	// Очищаем список вложений для новой/несвязанной заметки
+	if a.attachmentsList != nil {
+		a.attachmentsList.Refresh()
+	}
 	log.Println("Подготовлена форма для новой заметки")
 	a.noteList.Refresh() // Обновляем список, чтобы снять выделение
 }
@@ -432,6 +527,7 @@ func (a *NoteApp) saveNote() {
 	dialog.ShowInformation("Успех", "Заметка успешно сохранена!", a.window)
 	a.setUnsavedChanges(false) // Сброс флага после сохранения
 	a.deleteButton.Enable()
+	a.attachButton.Enable() // Включаем кнопку "Прикрепить файл" после сохранения
 	a.loadNotes()           // Перезагружаем список, чтобы обновить/добавить заметку
 	// Попытка снова выбрать заметку после обновления списка
 	if currentNote != nil {
@@ -440,6 +536,8 @@ func (a *NoteApp) saveNote() {
 				a.noteList.Select(i)
 				// Убедимся, что selectedNoteIndex обновлен корректно
 				a.selectedNoteIndex = i
+				// Перезагружаем вложения для выбранной заметки после сохранения
+				a.doSelectNote(i) // Это обновит вложения
 				break
 			}
 		}
@@ -454,7 +552,7 @@ func (a *NoteApp) deleteNote() {
 	}
 
 	dialog.ShowConfirm("Подтверждение удаления",
-		fmt.Sprintf("Вы уверены, что хотите удалить заметку '%s'?", selectedNote.Title),
+		fmt.Sprintf("Вы уверены, что хотите удалить заметку '%s'? Все связанные вложения также будут удалены.", selectedNote.Title),
 		func(confirmed bool) {
 			if confirmed {
 				err := a.store.DeleteNote(selectedNote.ID)
@@ -596,6 +694,15 @@ func (a *NoteApp) exportNote() {
 			var notesToExport []models.Note
 			if exportAll {
 				notesToExport = a.allNotes // Экспортируем все заметки
+				// Для экспорта всех заметок, нужно загрузить их вложения
+				for i, note := range notesToExport {
+					attachments, err := a.store.GetAttachmentsByNoteID(note.ID)
+					if err != nil {
+						log.Printf("Ошибка при загрузке вложений для заметки ID %d при экспорте: %v", note.ID, err)
+						// Продолжаем, но без вложений для этой заметки
+					}
+					notesToExport[i].Attachments = attachments
+				}
 			} else {
 				selectedNote := a.getSelectedNote()
 				if selectedNote == nil {
@@ -663,7 +770,7 @@ func (a *NoteApp) importNote() {
 		}
 
 		dialog.ShowConfirm("Импорт заметок",
-			fmt.Sprintf("Вы уверены, что хотите импортировать %d заметки(ок)? Существующие заметки с такими же ID будут перезаписаны, а новые добавлены.", len(importedNotes)),
+			fmt.Sprintf("Вы уверены, что хотите импортировать %d заметки(ок)? Существующие заметки с такими же ID будут перезаписаны, а новые добавлены. Вложения будут импортированы, если файлы существуют.", len(importedNotes)),
 			func(confirmed bool) {
 				if !confirmed {
 					return
@@ -704,6 +811,23 @@ func (a *NoteApp) importNote() {
 						}
 					}
 					importedCount++
+
+					// Импортируем вложения для этой заметки
+					for _, attach := range note.Attachments {
+						// Здесь мы предполагаем, что файлы вложений должны быть скопированы вручную
+						// или быть доступны по исходным путям.
+						// Для реального импорта, нужно будет скопировать файлы и обновить filepath.
+						// Сейчас просто создаем запись в БД, если файл существует по указанному пути.
+						if _, err := os.Stat(attach.Filepath); err == nil {
+							// Файл существует, создаем запись в БД
+							attach.NoteID = note.ID // Привязываем к только что созданной/обновленной заметке
+							if err := a.store.CreateAttachment(&attach); err != nil {
+								log.Printf("Ошибка при импорте вложения '%s' для заметки ID %d: %v", attach.Filename, note.ID, err)
+							}
+						} else {
+							log.Printf("Файл вложения '%s' не найден по пути '%s', запись не импортирована.", attach.Filename, attach.Filepath)
+						}
+					}
 				}
 
 				if importedCount > 0 {
@@ -729,4 +853,145 @@ func (a *NoteApp) showAboutDialog() {
 		widget.NewLabel("Данные хранятся в PostgreSQL."),
 	)
 	dialog.ShowCustom("О программе", "Закрыть", content, a.window)
+}
+
+// НОВЫЕ ФУНКЦИИ ДЛЯ ВЛОЖЕНИЙ
+
+// attachFile открывает диалог выбора файла и прикрепляет его к текущей заметке
+func (a *NoteApp) attachFile() {
+	selectedNote := a.getSelectedNote()
+	if selectedNote == nil {
+		dialog.ShowInformation("Ошибка", "Сначала выберите или сохраните заметку, чтобы прикрепить к ней файл.", a.window)
+		return
+	}
+
+	dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
+		if err != nil {
+			dialog.ShowError(err, a.window)
+			return
+		}
+		if reader == nil { // Пользователь отменил выбор
+			return
+		}
+		defer reader.Close()
+
+		originalFilename := filepath.Base(reader.URI().Path())
+		// Генерируем уникальное имя файла для хранения, чтобы избежать коллизий
+		uniqueFilename := fmt.Sprintf("%d_%s_%s", selectedNote.ID, time.Now().Format("20060102150405"), originalFilename)
+		destPath := filepath.Join(a.attachmentsDirPath, uniqueFilename)
+
+		// Копируем файл
+		destFile, err := os.Create(destPath)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("не удалось создать файл вложения: %w", err), a.window)
+			return
+		}
+		defer destFile.Close()
+
+		fileContent, err := ioutil.ReadAll(reader)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("не удалось прочитать файл: %w", err), a.window)
+			return
+		}
+		_, err = destFile.Write(fileContent)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("не удалось записать файл: %w", err), a.window)
+			return
+		}
+
+		// Получаем MIME-тип
+		mimeType := mime.TypeByExtension(filepath.Ext(originalFilename))
+		if mimeType == "" {
+			mimeType = "application/octet-stream" // Дефолтный тип, если не удалось определить
+		}
+
+		// Создаем запись в БД
+		attachment := &models.Attachment{
+			NoteID:    selectedNote.ID,
+			Filename:  originalFilename,
+			Filepath:  destPath,
+			MimeType:  mimeType,
+			SizeBytes: int64(len(fileContent)),
+		}
+
+		err = a.store.CreateAttachment(attachment)
+		if err != nil {
+			// Если запись в БД не удалась, пытаемся удалить скопированный файл
+			if removeErr := os.Remove(destPath); removeErr != nil {
+				log.Printf("Ошибка: не удалось удалить скопированный файл '%s' после ошибки БД: %v", destPath, removeErr)
+			}
+			dialog.ShowError(fmt.Errorf("не удалось сохранить информацию о вложении в БД: %w", err), a.window)
+			return
+		}
+
+		dialog.ShowInformation("Успех", "Файл успешно прикреплен!", a.window)
+		log.Printf("Файл '%s' прикреплен к заметке ID %d, сохранен как '%s'", originalFilename, selectedNote.ID, destPath)
+
+		// Обновляем UI
+		a.doSelectNote(a.selectedNoteIndex) // Перезагружаем заметку, чтобы обновить список вложений
+	}, a.window)
+}
+
+// openAttachment открывает выбранный файл вложения с помощью системного приложения
+// openAttachment открывает выбранный файл вложения с помощью системного приложения
+func (a *NoteApp) openAttachment(attachment models.Attachment) {
+	cmd := ""
+	args := []string{}
+
+	// Определяем команду для открытия файла в зависимости от ОС
+	switch fyne.CurrentDevice() {
+	// case "windows": //винда
+	// 	cmd = "cmd"
+	// 	args = []string{"/c", "start", attachment.Filepath}
+	// case "darwin": //mac
+	// 	cmd = "open"
+	// 	args = []string{attachment.Filepath}
+	default: // Linux и другие Unix-подобные
+		cmd = "xdg-open"
+		args = []string{attachment.Filepath}
+	}
+
+	command := exec.Command(cmd, args...)
+	err := command.Start()
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("не удалось открыть файл '%s': %w", attachment.Filename, err), a.window)
+		log.Printf("Ошибка при открытии файла '%s' (%s): %v", attachment.Filename, attachment.Filepath, err)
+	} else {
+		log.Printf("Открыт файл '%s' (%s)", attachment.Filename, attachment.Filepath)
+	}
+}
+
+// deleteAttachment удаляет выбранное вложение
+func (a *NoteApp) deleteAttachment(attachment models.Attachment) {
+	dialog.ShowConfirm("Подтверждение удаления",
+		fmt.Sprintf("Вы уверены, что хотите удалить вложение '%s'? Файл будет удален с диска.", attachment.Filename),
+		func(confirmed bool) {
+			if confirmed {
+				err := a.store.DeleteAttachment(attachment.ID)
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("не удалось удалить вложение: %w", err), a.window)
+					log.Printf("Ошибка при удалении вложения ID %d: %v", attachment.ID, err)
+					return
+				}
+				dialog.ShowInformation("Успех", "Вложение успешно удалено.", a.window)
+				log.Printf("Вложение ID %d ('%s') удалено.", attachment.ID, attachment.Filename)
+
+				// Обновляем UI
+				a.doSelectNote(a.selectedNoteIndex) // Перезагружаем заметку, чтобы обновить список вложений
+			}
+		}, a.window)
+}
+
+// formatBytes форматирует размер файла в удобочитаемый вид
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
