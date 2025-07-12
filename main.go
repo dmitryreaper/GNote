@@ -9,7 +9,7 @@ import (
 	"fyne.io/fyne/v2/app"
 
 	"GNote/storage"
-	"GNote/ui" 
+	"GNote/ui"
 )
 
 func main() {
@@ -37,7 +37,7 @@ func main() {
 	}
 	dbSSLMode := os.Getenv("DB_SSLMODE")
 	if dbSSLMode == "" {
-		dbSSLMode = "disable" 
+		dbSSLMode = "disable"
 	}
 
 	dbConfig := storage.Config{
@@ -55,14 +55,13 @@ func main() {
 		log.Fatalf("Ошибка при инициализации хранилища БД: %v", err)
 	}
 
-	// Инициализация Fyne приложения
 	a := app.New()
 	w := a.NewWindow("Приложение для заметок")
-	w.SetIcon(fyne.NewStaticResource("note.png", []byte{})) 
+	w.SetIcon(fyne.NewStaticResource("note.png", []byte{}))
 
 	// Создание и запуск UI приложения
 	noteApp := ui.NewNoteApp(w, store)
-	_ = noteApp 
+	_ = noteApp
 
 	w.ShowAndRun()
 }

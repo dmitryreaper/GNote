@@ -1,14 +1,14 @@
 package storage
 
 import (
+	"GNote/models"
 	"database/sql"
 	"fmt"
 	"log"
-	"time"
 	"os"
+	"time"
 
-	"github.com/lib/pq" 
-	"GNote/models" 
+	"github.com/lib/pq"
 )
 
 // Config содержит конфигурацию для подключения к БД
@@ -21,7 +21,7 @@ type Config struct {
 	SSLMode  string
 }
 
-// Store представляет собой интерфейс для взаимодействия с заметками
+// Store представляет собой интерфейс для взаимодействия с заметками и вложениями
 type Store interface {
 	CreateNote(note *models.Note) error
 	GetNoteByID(id int) (*models.Note, error)
@@ -38,17 +38,19 @@ type PostgresStore struct {
 	db *sql.DB
 }
 
-// NewPostgresStore создает новый экземпляр PostgresStore
+// NewPostgresStore создает новый экземпляр PostgresStore и устанавливает соединение с БД
 func NewPostgresStore(cfg Config) (*PostgresStore, error) {
+	// Формируем строку подключения
 	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.DBName, cfg.SSLMode)
 
+	// Открываем соединение с базой данных
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка при открытии соединения с БД: %w", err)
 	}
 
-	// Проверяем соединение
+	// Проверяем соединение с БД
 	if err = db.Ping(); err != nil {
 		return nil, fmt.Errorf("ошибка при подключении к БД: %w", err)
 	}
@@ -59,15 +61,16 @@ func NewPostgresStore(cfg Config) (*PostgresStore, error) {
 
 // CreateNote создает новую заметку в БД, включая теги и напоминания
 func (s *PostgresStore) CreateNote(note *models.Note) error {
+	// Начинаем транзакцию для обеспечения атомарности операций
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("не удалось начать транзакцию: %w", err)
 	}
-	defer tx.Rollback() // Откат в случае ошибки
+	defer tx.Rollback() // Откат транзакции в случае ошибки
 
-	// Вставляем заметку
+	// Вставляем основную информацию о заметке в таблицу notes
 	query := `INSERT INTO notes (title, content, reminder_at) VALUES ($1, $2, $3) RETURNING id, created_at, updated_at`
-	var reminderAtSQL sql.NullTime
+	var reminderAtSQL sql.NullTime // Используем sql.NullTime для работы с nullable полями
 	if note.ReminderAt != nil {
 		reminderAtSQL = sql.NullTime{Time: *note.ReminderAt, Valid: true}
 	}
@@ -76,16 +79,18 @@ func (s *PostgresStore) CreateNote(note *models.Note) error {
 		return fmt.Errorf("ошибка при создании заметки: %w", err)
 	}
 
-	// Обрабатываем теги
+	// Обрабатываем теги: вставляем новые теги или получаем ID существующих, затем связываем их с заметкой
 	if len(note.Tags) > 0 {
 		for _, tagName := range note.Tags {
 			var tagID int
-			// Ищем существующий тег или создаем новый
+			// Вставляем тег, если его нет, или обновляем (DO UPDATE SET name=EXCLUDED.name)
+			// RETURNING id возвращает ID тега (нового или существующего)
 			err := tx.QueryRow(`INSERT INTO tags (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name RETURNING id`, tagName).Scan(&tagID)
 			if err != nil {
 				return fmt.Errorf("ошибка при создании/получении тега: %w", err)
 			}
-			// Привязываем тег к заметке
+			// Привязываем тег к заметке в таблице note_tags
+			// ON CONFLICT DO NOTHING предотвращает дублирование связей
 			_, err = tx.Exec(`INSERT INTO note_tags (note_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, note.ID, tagID)
 			if err != nil {
 				return fmt.Errorf("ошибка при привязке тега к заметке: %w", err)
@@ -101,6 +106,7 @@ func (s *PostgresStore) GetNoteByID(id int) (*models.Note, error) {
 	var note models.Note
 	var reminderAtSQL sql.NullTime
 
+	// Получаем основную информацию о заметке
 	query := `SELECT id, title, content, created_at, updated_at, reminder_at FROM notes WHERE id = $1`
 	err := s.db.QueryRow(query, id).Scan(&note.ID, &note.Title, &note.Content, &note.CreatedAt, &note.UpdatedAt, &reminderAtSQL)
 	if err != nil {
@@ -110,6 +116,7 @@ func (s *PostgresStore) GetNoteByID(id int) (*models.Note, error) {
 		return nil, fmt.Errorf("ошибка при получении заметки по ID: %w", err)
 	}
 
+	// Преобразуем sql.NullTime в *time.Time
 	if reminderAtSQL.Valid {
 		note.ReminderAt = &reminderAtSQL.Time
 	}
@@ -119,7 +126,7 @@ func (s *PostgresStore) GetNoteByID(id int) (*models.Note, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ошибка при получении тегов заметки: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() // Закрываем rows после использования
 
 	var tags []string
 	for rows.Next() {
@@ -141,8 +148,9 @@ func (s *PostgresStore) GetNoteByID(id int) (*models.Note, error) {
 	return &note, nil
 }
 
-// GetAllNotes получает все заметки, включая теги (вложения не загружаем для списка, чтобы не перегружать)
+// GetAllNotes получает все заметки, включая теги (вложения не загружаются для списка)
 func (s *PostgresStore) GetAllNotes() ([]models.Note, error) {
+	// Запрос для получения заметок и агрегации тегов в массив
 	query := `
 		SELECT
 			n.id, n.title, n.content, n.created_at, n.updated_at, n.reminder_at,
@@ -162,7 +170,7 @@ func (s *PostgresStore) GetAllNotes() ([]models.Note, error) {
 	var notes []models.Note
 	for rows.Next() {
 		var note models.Note
-		var tagsArray pq.StringArray // <--- ИЗМЕНЕНИЕ ЗДЕСЬ: используем pq.StringArray
+		var tagsArray pq.StringArray // Используем pq.StringArray для сканирования массива строк из PostgreSQL
 		var reminderAtSQL sql.NullTime
 
 		if err := rows.Scan(&note.ID, &note.Title, &note.Content, &note.CreatedAt, &note.UpdatedAt, &reminderAtSQL, &tagsArray); err != nil {
@@ -174,7 +182,7 @@ func (s *PostgresStore) GetAllNotes() ([]models.Note, error) {
 		}
 
 		// Преобразуем pq.StringArray в []string
-		note.Tags = []string(tagsArray) // <--- ИЗМЕНЕНИЕ ЗДЕСЬ: прямое преобразование
+		note.Tags = []string(tagsArray)
 		// Вложения не загружаем здесь, только при выборе конкретной заметки
 		note.Attachments = []models.Attachment{}
 		notes = append(notes, note)
@@ -198,7 +206,7 @@ func (s *PostgresStore) UpdateNote(note *models.Note) error {
 	// Устанавливаем updated_at в Go, чтобы явно использовать пакет time
 	note.UpdatedAt = time.Now()
 
-	// Обновляем заметку
+	// Обновляем основную информацию о заметке
 	query := `UPDATE notes SET title = $1, content = $2, reminder_at = $3, updated_at = $4 WHERE id = $5`
 	var reminderAtSQL sql.NullTime
 	if note.ReminderAt != nil {
@@ -222,7 +230,7 @@ func (s *PostgresStore) UpdateNote(note *models.Note) error {
 		return fmt.Errorf("ошибка при удалении старых тегов: %w", err)
 	}
 
-	// Добавляем новые привязки тегов
+	// Добавляем новые привязки тегов (аналогично CreateNote)
 	if len(note.Tags) > 0 {
 		for _, tagName := range note.Tags {
 			var tagID int
@@ -240,7 +248,7 @@ func (s *PostgresStore) UpdateNote(note *models.Note) error {
 	return tx.Commit()
 }
 
-// DeleteNote удаляет заметку по ID
+// DeleteNote удаляет заметку по ID, включая связанные теги, вложения из БД и физические файлы вложений
 func (s *PostgresStore) DeleteNote(id int) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -255,16 +263,15 @@ func (s *PostgresStore) DeleteNote(id int) error {
 		log.Printf("Предупреждение: не удалось получить вложения для заметки ID %d при удалении: %v", id, err)
 	}
 
-	// Удаляем привязки тегов (CASCADE в БД позаботится об этом, но можно явно)
+	// Удаляем привязки тегов (если в БД нет CASCADE на note_tags)
+	// Если в note_tags есть ON DELETE CASCADE на note_id, этот шаг опционален
 	_, err = tx.Exec(`DELETE FROM note_tags WHERE note_id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("ошибка при удалении привязок тегов: %w", err)
 	}
 
-	// Удаляем вложения из таблицы attachments (благодаря ON DELETE CASCADE это сделает сама БД)
-	// Но если бы не было CASCADE, здесь был бы DELETE FROM attachments WHERE note_id = $1
-
-	// Удаляем заметку
+	// Удаляем заметку из таблицы notes
+	// Если в attachments есть ON DELETE CASCADE на note_id, записи вложений удалятся автоматически
 	res, err := tx.Exec(`DELETE FROM notes WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("ошибка при удалении заметки: %w", err)
@@ -327,7 +334,7 @@ func (s *PostgresStore) GetAttachmentsByNoteID(noteID int) ([]models.Attachment,
 
 // DeleteAttachment удаляет запись о вложении из БД и сам файл с диска
 func (s *PostgresStore) DeleteAttachment(attachmentID int) error {
-	// Сначала получаем путь к файлу
+	// Сначала получаем путь к файлу, чтобы удалить его с диска
 	var filepath string
 	query := `SELECT filepath FROM attachments WHERE id = $1`
 	err := s.db.QueryRow(query, attachmentID).Scan(&filepath)
