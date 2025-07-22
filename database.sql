@@ -1,0 +1,35 @@
+CREATE DATABASE gnotes_db;
+
+CREATE TABLE IF NOT EXISTS notes (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    content TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    reminder_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) UNIQUE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS note_tags (
+    note_id INT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    tag_id INT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (note_id, tag_id)
+);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    id SERIAL PRIMARY KEY,
+    note_id INT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    filename VARCHAR(255) NOT NULL,
+    filepath VARCHAR(255) UNIQUE NOT NULL,
+    mimetype VARCHAR(255),
+    size_bytes BIGINT,
+    uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_reminder_at ON notes (reminder_at);
+CREATE INDEX IF NOT EXISTS idx_attachments_note_id ON attachments (note_id);
